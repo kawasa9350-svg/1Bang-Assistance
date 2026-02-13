@@ -1,0 +1,1887 @@
+const { Client, GatewayIntentBits, Collection, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, PermissionFlagsBits, ComponentType } = require('discord.js');
+const mongoose = require('mongoose');
+const fetch = require('node-fetch');
+const config = require('./config');
+
+// Debug logging
+console.log('🔍 Debug Info:');
+console.log('BOT_TOKEN exists:', !!process.env.BOT_TOKEN);
+console.log('BOT_TOKEN length:', process.env.BOT_TOKEN ? process.env.BOT_TOKEN.length : 'undefined');
+console.log('BOT_TOKEN starts with:', process.env.BOT_TOKEN ? process.env.BOT_TOKEN.substring(0, 10) + '...' : 'undefined');
+console.log('CLIENT_ID exists:', !!process.env.CLIENT_ID);
+console.log('CLIENT_ID value:', process.env.CLIENT_ID);
+
+const User = require('./models/User');
+const Composition = require('./models/Composition');
+const SignupSession = require('./models/SignupSession');
+const Guild = require('./models/Guild');
+
+const ALBION_API_BASE_URL = process.env.ALBION_API_BASE_URL || 'https://gameinfo.albiononline.com/api/gameinfo';
+
+async function searchAlbionPlayers(ingameName) {
+    const searchUrl = `${ALBION_API_BASE_URL}/search?q=${encodeURIComponent(ingameName)}`;
+    const searchRes = await fetch(searchUrl);
+    if (!searchRes.ok) {
+        throw new Error(`Albion search failed with status ${searchRes.status}`);
+    }
+    const searchData = await searchRes.json();
+    const players = searchData.players || [];
+    // Return all exact matches
+    return players.filter(p => typeof p.Name === 'string' && p.Name.toLowerCase() === ingameName.toLowerCase());
+}
+
+async function getPlayerDetails(playerId) {
+    const playerUrl = `${ALBION_API_BASE_URL}/players/${playerId}`;
+    const playerRes = await fetch(playerUrl);
+    if (!playerRes.ok) {
+        throw new Error(`Albion player lookup failed with status ${playerRes.status}`);
+    }
+    const playerData = await playerRes.json();
+    return {
+        guildName: playerData.GuildName || null,
+        guildId: playerData.GuildId || null,
+        ...playerData // Return full data just in case
+    };
+}
+
+// Create Discord client with enhanced connection settings
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.MessageContent
+    ],
+    // Enhanced connection settings for better stability
+    rest: {
+        timeout: 30000, // 30 seconds timeout
+        retries: 3
+    },
+    // WebSocket settings
+    ws: {
+        large_threshold: 250,
+        compress: true
+    },
+    // Presence settings
+    presence: {
+        status: 'online',
+        activities: [{
+            name: 'Albion Online Alliance',
+            type: 0 // Playing
+        }]
+    }
+});
+
+// Create commands collection
+client.commands = new Collection();
+
+// Store comp creation data temporarily
+const compSessions = new Map();
+
+async function getGuildConfigByName(guildName) {
+    if (!guildName) {
+        return null;
+    }
+
+    const dbGuild = await Guild.findByNameCaseInsensitive(guildName);
+    if (dbGuild) {
+        return {
+            name: dbGuild.name,
+            roleId: dbGuild.roleId,
+            tag: dbGuild.tag || '',
+            color: dbGuild.color || config.embedColor,
+            source: 'database',
+            dbGuild
+        };
+    }
+
+    const configGuildName = Object.keys(config.guilds || {}).find(name => name.toLowerCase() === guildName.toLowerCase());
+    if (configGuildName) {
+        const guildConfig = config.guilds[configGuildName];
+        return {
+            name: configGuildName,
+            roleId: guildConfig.roleId,
+            tag: guildConfig.tag || '',
+            color: guildConfig.color || config.embedColor,
+            source: 'config'
+        };
+    }
+
+    return null;
+}
+
+async function getAllGuildChoices() {
+    const dbGuilds = await Guild.find({}).sort({ name: 1 }).lean();
+    const configGuilds = Object.keys(config.guilds || {});
+
+    const names = new Set();
+    dbGuilds.forEach(guild => names.add(guild.name));
+    configGuilds.forEach(name => names.add(name));
+
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
+}
+
+// MongoDB Connection
+mongoose.connect(config.mongoUri)
+    .then(() => console.log('✅ Connected to MongoDB'))
+    .catch(err => console.error('❌ MongoDB connection error:', err));
+
+// Bot ready event
+client.once('ready', () => {
+    console.log(`✅ Bot is online as ${client.user.tag}`);
+    console.log(`📊 Serving ${client.guilds.cache.size} servers`);
+    console.log(`🔗 Bot ID: ${client.user.id}`);
+    console.log(`🌐 Gateway: ${client.ws.gateway}`);
+    
+    // Set bot presence to show it's active
+    client.user.setPresence({
+        activities: [{
+            name: 'Albion Online Alliance',
+            type: 0 // Playing
+        }],
+        status: 'online'
+    });
+});
+
+// Connection status monitoring
+client.on('shardReady', (id) => {
+    console.log(`🟢 Shard ${id} is ready`);
+});
+
+client.on('shardReconnecting', (id) => {
+    console.log(`🔄 Shard ${id} is reconnecting...`);
+});
+
+client.on('shardResumed', (id) => {
+    console.log(`✅ Shard ${id} resumed`);
+});
+
+client.on('shardDisconnect', (event, id) => {
+    console.log(`🔴 Shard ${id} disconnected:`, event);
+});
+
+client.on('shardError', (error, id) => {
+    console.error(`❌ Shard ${id} error:`, error);
+});
+
+// Handle disconnection and reconnection
+client.on('disconnect', () => {
+    console.log('🔌 Bot disconnected from Discord');
+});
+
+client.on('reconnecting', () => {
+    console.log('🔄 Bot reconnecting to Discord...');
+});
+
+client.on('resume', () => {
+    console.log('✅ Bot reconnected to Discord');
+});
+
+// Slash command interaction handler
+client.on('interactionCreate', async (interaction) => {
+    if (interaction.isChatInputCommand()) {
+        const { commandName } = interaction;
+
+        if (commandName === 'register') {
+            await handleRegisterCommand(interaction);
+        } else if (commandName === 'lootsplit') {
+            await handleLootsplitCommand(interaction);
+        } else if (commandName === 'comp') {
+            await handleCompCommand(interaction);
+        } else if (commandName === 'signup') {
+            await handleSignupCommand(interaction);
+        } else if (commandName === 'add-guild') {
+            await handleAddGuildCommand(interaction);
+        } else if (commandName === 'remove-guild') {
+            await handleRemoveGuildCommand(interaction);
+        }
+    }
+});
+
+// Register command handler
+async function handleRegisterCommand(interaction) {
+    // Proactively defer reply to avoid timeout (3s limit)
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+        const selectedGuild = interaction.options.getString('guild');
+        const ingameName = interaction.options.getString('ingame_name').trim();
+        const guildConfig = await getGuildConfigByName(selectedGuild);
+        
+        if (!guildConfig) {
+            await interaction.editReply({ 
+                content: '❌ Invalid guild selection. Please try again.'
+            });
+            return;
+        }
+
+        const guildDisplayName = guildConfig.name || selectedGuild;
+        const guildRoleId = guildConfig.roleId;
+        const guildTag = guildConfig.tag ? guildConfig.tag.trim() : '';
+        const embedColor = guildConfig.color || config.embedColor;
+
+        if (ingameName.length < 2 || ingameName.length > 20) {
+            await interaction.editReply({ 
+                content: '❌ In-game name must be between 2 and 20 characters.'
+            });
+            return;
+        }
+
+        let apiGuildMatch = null;
+        try {
+            const matches = await searchAlbionPlayers(ingameName);
+            let selectedPlayerId = null;
+
+            if (matches.length === 0) {
+                 await interaction.editReply({
+                    content: '❌ Could not find your character in the Albion API. Make sure your in-game name is correct and try again.'
+                });
+                return;
+            } else if (matches.length === 1) {
+                selectedPlayerId = matches[0].Id;
+            } else {
+                 // Multiple matches
+                 // Limit to 10 to avoid API rate limits and ensure responsiveness
+                 const candidateMatches = matches.slice(0, 10);
+                 
+                 // Fetch details for all candidates in parallel to get accurate Total Fame
+                 const detailedMatches = await Promise.all(candidateMatches.map(async (p) => {
+                     try {
+                         return await getPlayerDetails(p.Id);
+                     } catch (e) {
+                         console.error(`Failed to fetch details for ${p.Name}`, e);
+                         return p; // Fallback to search result object
+                     }
+                 }));
+
+                 const options = detailedMatches.map(p => {
+                     let totalFame = 0;
+                     if (p.LifetimeStatistics) {
+                         const killFame = p.KillFame || 0;
+                         const pveFame = p.LifetimeStatistics.PvE ? p.LifetimeStatistics.PvE.Total : 0;
+                         const craftingFame = p.LifetimeStatistics.Crafting ? p.LifetimeStatistics.Crafting.Total : 0;
+                         const gatheringFame = p.LifetimeStatistics.Gathering && p.LifetimeStatistics.Gathering.All ? p.LifetimeStatistics.Gathering.All.Total : 0;
+                         const farmingFame = p.LifetimeStatistics.FarmingFame || 0;
+                         const fishingFame = p.LifetimeStatistics.FishingFame || 0;
+                         
+                         totalFame = killFame + pveFame + craftingFame + gatheringFame + farmingFame + fishingFame;
+                     } else {
+                         // Fallback for search results without details
+                         totalFame = (p.KillFame || 0) + (p.DeathFame || 0);
+                     }
+
+                     return {
+                         label: `${p.Name} (${p.GuildName || 'No Guild'})`,
+                         description: `Total Fame: ${totalFame.toLocaleString()}`,
+                         value: p.Id
+                     };
+                 });
+
+                 const row = new ActionRowBuilder()
+                     .addComponents(
+                         new StringSelectMenuBuilder()
+                             .setCustomId('select_player')
+                             .setPlaceholder('Select your character')
+                             .addOptions(options)
+                     );
+
+                 const response = await interaction.editReply({
+                     content: `Found ${matches.length} players named **${ingameName}**. Please select yours:`,
+                     components: [row],
+                     fetchReply: true
+                 });
+
+                 try {
+                     const confirmation = await response.awaitMessageComponent({ 
+                         filter: i => i.user.id === interaction.user.id && i.customId === 'select_player', 
+                         time: 60000 
+                     });
+                     
+                     selectedPlayerId = confirmation.values[0];
+                     await confirmation.update({ content: `Checking details for selected character...`, components: [] });
+                 } catch (e) {
+                     return interaction.editReply({ content: '❌ Selection timed out. Please try again.', components: [] });
+                 }
+            }
+
+            const apiGuild = await getPlayerDetails(selectedPlayerId);
+
+            if (!apiGuild || !apiGuild.guildName) {
+                const msg = {
+                    content: '❌ Could not verify your guild in the Albion API. Please make sure you are in a guild.',
+                    ephemeral: true
+                };
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.editReply({ ...msg, components: [] });
+                } else {
+                    await interaction.reply(msg);
+                }
+                return;
+            }
+            apiGuildMatch = apiGuild.guildName;
+            if (apiGuild.guildName.toLowerCase() !== guildDisplayName.toLowerCase()) {
+                const msg = {
+                    content: `❌ In-game you are in **${apiGuild.guildName}**, not **${guildDisplayName}**. Please select the correct guild that matches your in-game guild.`,
+                    ephemeral: true
+                };
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.editReply({ ...msg, components: [] });
+                } else {
+                    await interaction.reply(msg);
+                }
+                return;
+            }
+        } catch (apiError) {
+            console.error('Error verifying Albion guild:', apiError);
+            const msg = {
+                content: '❌ Failed to verify your guild with the Albion API. Please try again later or contact an officer.',
+                ephemeral: true
+            };
+            if (interaction.deferred || interaction.replied) {
+                await interaction.editReply({ ...msg, components: [] });
+            } else {
+                await interaction.reply(msg);
+            }
+            return;
+        }
+
+        const existingUsersWithName = await User.find({
+            ingameName: { $regex: new RegExp(`^${ingameName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+        }).lean();
+
+        if (existingUsersWithName.length > 0) {
+            let hasActiveOwner = false;
+
+            for (const existing of existingUsersWithName) {
+                if (!existing.discordId || existing.discordId === interaction.user.id) {
+                    continue;
+                }
+
+                try {
+                    await interaction.guild.members.fetch(existing.discordId);
+                    hasActiveOwner = true;
+                    break;
+                } catch (e) {
+                    continue;
+                }
+            }
+
+            if (hasActiveOwner) {
+                const msg = {
+                    content: '❌ This in-game name is already registered to another member in this server. If you believe this is your account, please contact an officer.',
+                    ephemeral: true
+                };
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.editReply({ ...msg, components: [] });
+                } else {
+                    await interaction.reply(msg);
+                }
+                return;
+            }
+        }
+
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+
+        let nicknameChanged = false;
+        let nicknameError = '';
+
+        try {
+            if (guildRoleId) {
+                const role = interaction.guild.roles.cache.get(guildRoleId);
+                if (role) {
+                    await member.roles.add(role);
+                } else {
+                    console.warn(`Guild role with ID ${guildRoleId} not found in guild ${interaction.guild.id}`);
+                }
+            } else {
+                console.warn(`Guild ${guildDisplayName} does not have a configured roleId`);
+            }
+        } catch (error) {
+            console.error('Error assigning guild role:', error);
+        }
+
+        if (config.requiredRoleId) {
+            try {
+                const requiredRole = interaction.guild.roles.cache.get(config.requiredRoleId);
+                if (requiredRole) {
+                    await member.roles.add(requiredRole);
+                } else {
+                    console.warn(`Required role with ID ${config.requiredRoleId} not found in guild ${interaction.guild.id}`);
+                }
+            } catch (error) {
+                console.error('Error assigning required alliance role:', error);
+            }
+        }
+
+        // Change nickname with guild tag
+        try {
+            const newNickname = guildTag ? `${guildTag} ${ingameName}` : ingameName;
+            await member.setNickname(newNickname);
+            nicknameChanged = true;
+        } catch (error) {
+            console.error('Error changing nickname:', error);
+            nicknameError = guildTag
+                ? `Please manually change your nickname to: **${guildTag} ${ingameName}**`
+                : `Please manually change your nickname to: **${ingameName}**`;
+        }
+
+        const updatedMember = await interaction.guild.members.fetch(interaction.user.id);
+        const hasGuildRoleAssigned = guildRoleId ? updatedMember.roles.cache.has(guildRoleId) : false;
+        const hasAllianceRoleAssigned = config.requiredRoleId ? updatedMember.roles.cache.has(config.requiredRoleId) : false;
+
+        const userData = {
+            discordId: interaction.user.id,
+            username: interaction.user.username,
+            guild: guildDisplayName,
+            ingameName: ingameName,
+            registeredAt: new Date(),
+            hasRequiredRole: hasAllianceRoleAssigned
+        };
+
+        await User.findOneAndUpdate(
+            { discordId: interaction.user.id },
+            userData,
+            { upsert: true, new: true }
+        );
+        
+        const confirmEmbed = new EmbedBuilder()
+            .setTitle('✅ Registration Successful!')
+            .setDescription(`Welcome to ${guildDisplayName}!`)
+            .setColor(embedColor)
+            .addFields(
+                { name: 'In-Game Name', value: ingameName, inline: true },
+                { name: 'Guild', value: guildDisplayName, inline: true },
+                { name: 'Nickname Changed', value: nicknameChanged ? '✅ Yes' : '❌ No (Bot lacks permission)', inline: true }
+            )
+            .setTimestamp();
+
+        // Add nickname instruction if there was an error
+        if (nicknameError) {
+            confirmEmbed.addFields({ name: '📝 Manual Action Required', value: nicknameError, inline: false });
+        }
+
+        await interaction.editReply({ content: '✅ Registration complete.', components: [] });
+        await interaction.followUp({ embeds: [confirmEmbed] });
+
+    } catch (error) {
+        console.error('Error in register command:', error);
+        try {
+            if (interaction.deferred || interaction.replied) {
+                await interaction.editReply({
+                    content: '❌ An error occurred while processing your registration. Please try again later.',
+                    components: []
+                });
+            } else {
+                await interaction.reply({ 
+                    content: '❌ An error occurred while processing your registration. Please try again later.', 
+                    ephemeral: true 
+                });
+            }
+        } catch (replyError) {
+            console.error('Discord Client Error:', replyError);
+        }
+    }
+}
+
+async function handleAddGuildCommand(interaction) {
+    // Proactively defer reply to avoid timeout (3s limit)
+    await interaction.deferReply({ ephemeral: true });
+
+    if (!interaction.inGuild() || !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        await interaction.editReply({
+            content: '❌ You need the **Manage Server** permission to use this command.'
+        });
+        return;
+    }
+
+    const name = interaction.options.getString('name').trim();
+    const roleId = interaction.options.getString('role_id').trim();
+    const tag = interaction.options.getString('tag')?.trim() || '';
+    const colorInput = interaction.options.getString('color')?.trim() || '';
+
+    if (!/^\d{17,19}$/.test(roleId)) {
+        await interaction.editReply({
+            content: '❌ Invalid role ID. Please provide a valid Discord role ID.'
+        });
+        return;
+    }
+
+    let color = colorInput;
+    if (color) {
+        if (!/^#?[0-9A-Fa-f]{6}$/.test(color)) {
+            await interaction.editReply({
+                content: '❌ Invalid color format. Please provide a hex color like `#FFAA00`.'
+            });
+            return;
+        }
+        if (!color.startsWith('#')) {
+            color = `#${color}`;
+        }
+    } else {
+        color = config.embedColor;
+    }
+
+    const existingGuild = await Guild.findByNameCaseInsensitive(name);
+
+    let guildDoc;
+    if (existingGuild) {
+        existingGuild.roleId = roleId;
+        existingGuild.tag = tag;
+        existingGuild.color = color;
+        existingGuild.updatedBy = {
+            discordId: interaction.user.id,
+            username: interaction.user.username
+        };
+        guildDoc = await existingGuild.save();
+    } else {
+        guildDoc = await Guild.create({
+            name,
+            roleId,
+            tag,
+            color,
+            createdBy: {
+                discordId: interaction.user.id,
+                username: interaction.user.username
+            },
+            updatedBy: {
+                discordId: interaction.user.id,
+                username: interaction.user.username
+            }
+        });
+    }
+
+    const baseMessage = `• Role ID: \`${guildDoc.roleId}\`\n• Tag: \`${guildDoc.tag || 'None'}\`\n• Color: \`${guildDoc.color}\``;
+
+    await interaction.editReply({
+        content: existingGuild
+            ? `✅ Updated guild **${guildDoc.name}**.\n${baseMessage}`
+            : `✅ Added new guild **${guildDoc.name}**.\n${baseMessage}\n\n✅ The guild is now available in /register autocomplete.`
+    });
+}
+
+async function handleRemoveGuildCommand(interaction) {
+    // Proactively defer reply to avoid timeout (3s limit)
+    await interaction.deferReply({ ephemeral: true });
+
+    if (!interaction.inGuild() || !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        await interaction.editReply({
+            content: '❌ You need the **Manage Server** permission to use this command.'
+        });
+        return;
+    }
+
+    const name = interaction.options.getString('name').trim();
+    const guildDoc = await Guild.findByNameCaseInsensitive(name);
+
+    if (!guildDoc) {
+        await interaction.editReply({
+            content: `❌ Guild **${name}** was not found in the database.`
+        });
+        return;
+    }
+
+    await guildDoc.deleteOne();
+
+    await interaction.editReply({
+        content: `✅ Removed guild **${guildDoc.name}**.\n\n✅ It has been removed from /register autocomplete.`
+    });
+}
+// Lootsplit command handler
+async function handleLootsplitCommand(interaction) {
+    // Proactively defer reply to avoid timeout (3s limit)
+    await interaction.deferReply();
+
+    try {
+        const contentType = interaction.options.getString('content_type');
+        const usersInput = interaction.options.getString('users');
+        const callerInput = interaction.options.getString('caller');
+        const repairFees = interaction.options.getInteger('repair_fees');
+        const totalLoot = interaction.options.getInteger('total_loot');
+        const silverBags = interaction.options.getInteger('silver_bags') || 0;
+
+        // Get content type config
+        const contentConfig = config.contentTypes[contentType];
+        
+        console.log(`[Lootsplit] Input: Total=${totalLoot}, SilverBags=${silverBags}, Repairs=${repairFees}, Users=${usersInput}, Caller=${callerInput}`);
+        
+        if (!contentConfig) {
+            await interaction.editReply({ 
+                content: '❌ Invalid content type selected.'
+            });
+            return;
+        }
+
+        // Parse mentioned users from the users input string
+        const mentionRegex = /<@!?(\d+)>/g;
+        const userIds = [];
+        let match;
+        
+        while ((match = mentionRegex.exec(usersInput)) !== null) {
+            userIds.push(match[1]);
+        }
+
+        if (userIds.length === 0) {
+            await interaction.editReply({ 
+                content: '❌ Please mention the users participating in the loot split.'
+            });
+            return;
+        }
+
+        // Parse caller from the caller input string
+        if (!callerInput) {
+            await interaction.editReply({ 
+                content: '❌ This command has been updated. Please use the new format: `/lootsplit content_type users caller total_loot silver_bags repair_fees`\n\n**New format:**\n- `content_type`: Type of content\n- `users`: Mention participating users\n- `caller`: Mention the caller\n- `total_loot`: Total loot value (can be 0)\n- `silver_bags`: Untaxed silver bags (can be 0)\n- `repair_fees`: Repair fees\n\nPlease try the command again with the updated format.'
+            });
+            return;
+        }
+        
+        const callerMatch = callerInput.match(/<@!?(\d+)>/);
+        if (!callerMatch) {
+            await interaction.editReply({ 
+                content: '❌ Please mention the caller user.'
+            });
+            return;
+        }
+        const callerId = callerMatch[1];
+
+        // Fetch the mentioned users
+        const mentionedUsers = new Map();
+        for (const userId of userIds) {
+            try {
+                const user = await client.users.fetch(userId);
+                mentionedUsers.set(userId, user);
+            } catch (error) {
+                console.error(`Error fetching user ${userId}:`, error);
+            }
+        }
+
+        // Fetch caller
+        let caller;
+        try {
+            caller = await client.users.fetch(callerId);
+        } catch (error) {
+            console.error(`Error fetching caller ${callerId}:`, error);
+            await interaction.editReply({ 
+                content: '❌ Error fetching caller user.'
+            });
+            return;
+        }
+
+        // Automatically add caller to participants if not already present
+        const callerAlreadyInParticipants = userIds.includes(callerId);
+        if (!callerAlreadyInParticipants) {
+            // Add caller to the participants list
+            userIds.push(callerId);
+            mentionedUsers.set(callerId, caller);
+        }
+
+        // Check if all mentioned users (including potentially added caller) are registered
+        const unregisteredUsers = [];
+        const registeredUsers = [];
+
+        for (const [userId, user] of mentionedUsers) {
+            const userData = await User.findOne({ discordId: userId });
+            if (userData) {
+                registeredUsers.push({
+                    user: user,
+                    ingameName: userData.ingameName,
+                    guild: userData.guild
+                });
+            } else {
+                unregisteredUsers.push(user);
+            }
+        }
+
+        // Check if caller is registered
+        const callerData = await User.findOne({ discordId: callerId });
+        if (!callerData) {
+            await interaction.editReply({ 
+                content: `❌ The caller ${caller} needs to register first.\n\nPlease use \`/register\` to register before participating in loot splits.`
+            });
+            return;
+        }
+
+        // If there are unregistered users, show error
+        if (unregisteredUsers.length > 0) {
+            const unregisteredMentions = unregisteredUsers.map(user => `<@${user.id}>`).join(', ');
+            await interaction.editReply({ 
+                content: `❌ The following users need to register first: ${unregisteredMentions}\n\nPlease use \`/register\` to register before participating in loot splits.`
+            });
+            return;
+        }
+
+        // Calculate loot split (repair fees subtracted first, then caller fee, no guild tax)
+        // Ensure net loot is not negative (if total_loot is 0 for silver bags only split)
+        const lootAfterRepairFees = Math.max(0, totalLoot - repairFees);
+        
+        const callerFeeRate = config.callerFeeRate;
+        const callerFee = Math.floor(lootAfterRepairFees * callerFeeRate);
+        const lootAfterCallerFee = lootAfterRepairFees - callerFee;
+        
+        // Add silver bags (untaxed) to the distributable amount
+        const totalDistributable = lootAfterCallerFee + silverBags;
+        
+        const lootPerPerson = Math.floor(totalDistributable / registeredUsers.length);
+
+        // Group users by guild for per-guild totals
+        const guildTotals = {};
+        const guildPlayerCounts = {};
+        
+        // Count players per guild
+        registeredUsers.forEach(user => {
+            if (!guildPlayerCounts[user.guild]) {
+                guildPlayerCounts[user.guild] = 0;
+            }
+            guildPlayerCounts[user.guild]++;
+        });
+        
+        // Calculate per-guild totals (player payouts + caller fee if caller is from that guild)
+        Object.entries(guildPlayerCounts).forEach(([guild, playerCount]) => {
+            const totalPerGuild = lootPerPerson * playerCount;
+            // Add caller fee to the caller's guild
+            if (guild === callerData.guild) {
+                guildTotals[guild] = totalPerGuild + callerFee;
+            } else {
+                guildTotals[guild] = totalPerGuild;
+            }
+        });
+
+        // Create embed
+        const embed = new EmbedBuilder()
+            .setTitle(`💰 Loot Split - ${contentType}`)
+            .setColor(contentConfig.color)
+            .addFields(
+                { name: '📊 Summary', value: `**Total Loot:** ${totalLoot.toLocaleString()} silver\n**Repair Fees:** ${repairFees.toLocaleString()} silver\n**After Repairs:** ${lootAfterRepairFees.toLocaleString()} silver\n**Caller Fee (${(callerFeeRate * 100).toFixed(1)}%):** ${callerFee.toLocaleString()} silver\n**Silver Bags:** ${silverBags.toLocaleString()} silver\n**Per Person:** ${lootPerPerson.toLocaleString()} silver`, inline: false },
+                { name: '📢 Caller', value: `${caller} - ${callerData.guild}`, inline: false }
+            )
+            .setTimestamp();
+
+        // Add players list grouped by guild
+        const playersByGuild = {};
+        registeredUsers.forEach(user => {
+            if (!playersByGuild[user.guild]) {
+                playersByGuild[user.guild] = [];
+            }
+            playersByGuild[user.guild].push(user.user.id);
+        });
+
+        const sortedGuilds = Object.keys(playersByGuild).sort();
+
+        let participantsContent = '';
+        for (const guild of sortedGuilds) {
+            const memberIds = playersByGuild[guild];
+            participantsContent += `**${guild} (${memberIds.length})**\n`;
+            participantsContent += memberIds.map(id => `<@${id}>`).join(', ') + '\n\n';
+        }
+
+        // Chunking logic for the new format
+        const lines = participantsContent.split('\n');
+        let currentField = '';
+        let fieldCount = 1;
+
+        for (const line of lines) {
+            // Check if adding this line would exceed the limit
+            if (currentField.length + line.length + 1 >= 1000) {
+                embed.addFields({ name: `👥 Participants ${fieldCount > 1 ? `(${fieldCount})` : ''}`, value: currentField, inline: false });
+                currentField = line;
+                fieldCount++;
+            } else {
+                currentField = currentField ? `${currentField}\n${line}` : line;
+            }
+        }
+        
+        // Add the last field
+        if (currentField) {
+            embed.addFields({ name: `👥 Participants ${fieldCount > 1 ? `(${fieldCount})` : ''}`, value: currentField, inline: false });
+        }
+
+        // Add per guild totals
+        const perGuildTotals = Object.entries(guildTotals)
+            .map(([guild, total]) => `**${guild}:** ${total.toLocaleString()} silver (${guildPlayerCounts[guild]} players)`)
+            .join('\n');
+
+        embed.addFields({ name: '🏛️ Guild Breakdown', value: perGuildTotals, inline: false });
+
+        // Edit the deferred reply
+        await interaction.editReply({ embeds: [embed] });
+
+        // Send split to Phoenix Assistance for tax/balance handling (webhook) - do this after reply
+        // Only send Phoenix Rebels members to Phoenix, filter out other guilds
+        if (config.phoenixWebhookUrl && config.phoenixWebhookSecret) {
+            // Run webhook in background (don't await to avoid blocking)
+            (async () => {
+                try {
+                    const targetGuildId = config.phoenixTargetGuildId || interaction.guildId;
+                    
+                    // Filter to only Phoenix Rebels members - exclude other guilds even if registered in Phoenix
+                    const phoenixRebelsUsers = registeredUsers.filter(user => user.guild === 'Phoenix Rebels');
+                    const phoenixRebelsUserIds = phoenixRebelsUsers.map(user => user.user.id);
+                    
+                    // Only send if there are Phoenix Rebels members
+                    if (phoenixRebelsUserIds.length > 0) {
+                        // Calculate Phoenix Rebels portion
+                        // We need to separate Taxable Loot (Net Loot) and Silver Bags (Untaxed)
+                        
+                        const totalParticipants = registeredUsers.length;
+                        const phoenixCount = phoenixRebelsUserIds.length;
+                        
+                        // Calculate per-person shares (keep as float for precision)
+                        const taxablePerPerson = lootAfterCallerFee / totalParticipants;
+                        const silverPerPerson = silverBags / totalParticipants;
+                        
+                        // Calculate Phoenix Totals
+                        let phoenixTaxableLoot = Math.floor(taxablePerPerson * phoenixCount);
+                        const phoenixSilverBags = Math.floor(silverPerPerson * phoenixCount);
+                        
+                        // If caller is in Phoenix, add the caller fee to the Taxable Bundle
+                        // Phoenix Assistance will handle separating it out again based on explicitCallerFee
+                        if (callerData && callerData.guild === 'Phoenix Rebels') {
+                            phoenixTaxableLoot += callerFee;
+                        }
+
+                        const payload = {
+                            guildId: targetGuildId,
+                            contentType,
+                            totalLoot: phoenixTaxableLoot, // This is NET loot (after repairs/caller fee)
+                            silverBags: phoenixSilverBags, // Untaxed component
+                            repairFees: 0, // We send 0 because totalLoot is already NET of repairs
+                            explicitCallerFee: callerFee, // The exact fee amount
+                            callerFeeRate,
+                            callerId, 
+                            participants: phoenixRebelsUserIds 
+                        };
+                        
+                        console.log(`[Lootsplit] Sending to Phoenix: Total=${phoenixTaxableLoot}, SilverBags=${phoenixSilverBags}, Participants=${phoenixRebelsUserIds.length}`);
+
+                        // Send actual callerId - Phoenix will only credit caller fee if caller is Phoenix Rebels
+                        const res = await fetch(config.phoenixWebhookUrl, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Webhook-Secret': config.phoenixWebhookSecret
+                            },
+                            body: JSON.stringify(payload)
+                        });
+                        
+                        if (!res.ok) {
+                            const text = await res.text();
+                            console.error('Phoenix ingest failed', res.status, text);
+                        } else {
+                            console.log(`Phoenix ingest ok - credited ${phoenixRebelsUserIds.length} Phoenix Rebels members`);
+                        }
+                    } else {
+                        console.log('No Phoenix Rebels members in split; skipping Phoenix webhook');
+                    }
+                } catch (error) {
+                    console.error('Failed to send split to Phoenix:', error);
+                }
+            })();
+        } else {
+            console.warn('Phoenix webhook not configured; skipping outbound split');
+        }
+
+    } catch (error) {
+        console.error('Error in lootsplit command:', error);
+        try {
+            // Check if interaction was already replied to
+            if (interaction.replied || interaction.deferred) {
+                await interaction.editReply({ 
+                    content: '❌ An error occurred while calculating the loot split. Please try again later.'
+                });
+            } else {
+                await interaction.reply({ 
+                    content: '❌ An error occurred while calculating the loot split. Please try again later.',
+                    ephemeral: true
+                });
+            }
+        } catch (replyError) {
+            // If interaction expired or already responded, just log it
+            console.error('Failed to send error message to user:', replyError);
+        }
+    }
+}
+
+// Comp command handler
+async function handleCompCommand(interaction) {
+    try {
+        const subcommand = interaction.options.getSubcommand();
+        
+        if (subcommand === 'create') {
+            await handleCompCreateCommand(interaction);
+        } else if (subcommand === 'list') {
+            await handleCompListCommand(interaction);
+        }
+    } catch (error) {
+        console.error('Error in comp command:', error);
+        if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ 
+                content: '❌ An error occurred while processing the comp command. Please try again later.'
+            });
+        } else {
+            await interaction.reply({ 
+                content: '❌ An error occurred while processing the comp command. Please try again later.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
+// Comp create command handler
+async function handleCompCreateCommand(interaction) {
+    try {
+        const contentType = interaction.options.getString('content_type');
+        
+        // Create step 1 embed - Enter comp name
+        const embed = new EmbedBuilder()
+            .setTitle('🎭 Comp Creation')
+            .setDescription('Step 2: Enter a name for your comp.')
+            .addFields({ name: 'Selected Content Type', value: contentType, inline: false })
+            .setColor('#0099ff')
+            .setFooter({ text: 'Phoenix Assistance Bot • Step 2 of 3 • Today at 1:40 PM' })
+            .setTimestamp();
+
+        // Create button for entering comp name
+        const enterNameButton = new ButtonBuilder()
+            .setCustomId('enter_comp_name')
+            .setLabel('Enter Comp Name')
+            .setStyle(ButtonStyle.Primary)
+            .setEmoji('📝');
+
+        const row = new ActionRowBuilder().addComponents(enterNameButton);
+
+        await interaction.reply({ 
+            embeds: [embed], 
+            components: [row],
+            ephemeral: true 
+        });
+        
+    } catch (error) {
+        console.error('Error in comp create command:', error);
+        if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ 
+                content: '❌ An error occurred while creating the composition. Please try again later.'
+            });
+        } else {
+            await interaction.reply({ 
+                content: '❌ An error occurred while creating the composition. Please try again later.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
+// Comp list command handler
+async function handleCompListCommand(interaction) {
+    // Proactively defer reply to avoid timeout (3s limit)
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+        const compName = interaction.options.getString('comp');
+
+        if (!compName) {
+            await interaction.editReply({
+                content: '❌ Please pick a comp, e.g. `/comp list comp:<your comp>`'
+            });
+            return;
+        }
+
+        const comp = await Composition.findOne({ name: compName });
+        if (!comp) {
+            await interaction.editReply({
+                content: `❌ Comp "${compName}" not found.`
+            });
+            return;
+        }
+
+        const rolesList = (comp.roles && comp.roles.length > 0)
+            ? comp.roles.map((role, index) => `${index + 1}. ${role}`).join('\n')
+            : 'No builds saved for this comp.';
+
+        const embed = new EmbedBuilder()
+            .setTitle(`📋 ${comp.name}`)
+            .addFields({ name: 'Available Builds', value: rolesList })
+            .setColor('#0099ff')
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+        
+    } catch (error) {
+        console.error('Error in comp list command:', error);
+        if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ 
+                content: '❌ An error occurred while fetching comps. Please try again later.'
+            });
+        } else {
+            await interaction.reply({ 
+                content: '❌ An error occurred while fetching comps. Please try again later.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
+// Signup autocomplete handler
+async function handleSignupAutocomplete(interaction) {
+    try {
+        console.log('Autocomplete triggered for signup command');
+        
+        // Get all comps from database
+        const comps = await Composition.find({})
+            .select('name')
+            .sort({ name: 1 })
+            .limit(25);
+        
+        console.log('Found comps in database:', comps.length);
+        
+        // Format choices for Discord
+        const choices = comps.map(comp => ({
+            name: comp.name,
+            value: comp.name
+        }));
+        
+        console.log('Sending choices to Discord:', choices.length);
+        
+        if (choices.length === 0) {
+            await interaction.respond([{
+                name: 'No comps found - Create one with /comp create',
+                value: 'no-comps-found'
+            }]);
+        } else {
+            await interaction.respond(choices);
+        }
+        
+    } catch (error) {
+        console.error('Error in signup autocomplete:', error);
+        await interaction.respond([{
+            name: 'Error loading comps',
+            value: 'error-loading'
+        }]);
+    }
+}
+
+// Signup command handler
+async function handleSignupCommand(interaction) {
+    // Proactively defer reply to avoid timeout (3s limit)
+    await interaction.deferReply();
+
+    try {
+        const compName = interaction.options.getString('comp');
+        
+        // Handle special cases
+        if (compName === 'no-comps-found' || compName === 'error-loading') {
+            await interaction.editReply({ 
+                content: '❌ No comps found in database. Create a comp first with `/comp create`.'
+            });
+            return;
+        }
+        
+        // Find the comp in database
+        const comp = await Composition.findOne({ name: compName });
+        if (!comp) {
+            await interaction.editReply({ 
+                content: `❌ Comp "${compName}" not found. Use \`/comp list\` to see available comps.`
+            });
+            return;
+        }
+        
+        // Generate session ID
+        const sessionId = Math.random().toString(36).substring(2, 15);
+        
+        // Create signup session
+        const signupSession = new SignupSession({
+            sessionId: sessionId,
+            compId: comp._id,
+            compName: comp.name,
+            roles: comp.roles.map(role => ({
+                roleName: role,
+                signups: []
+            })),
+            createdBy: {
+                discordId: interaction.user.id,
+                username: interaction.user.username
+            }
+        });
+        
+        await signupSession.save();
+        
+        // Add roles list
+        const rolesList = comp.roles.map((role, index) => 
+            `${index + 1}. ${role} - No signups`
+        ).join('\n');
+        
+        // Create signup embed
+        const embed = new EmbedBuilder()
+            .setTitle(`📝 Build Signup - 0/${comp.roles.length}`)
+            .addFields(
+                { name: `${comp.name} - Available Builds`, value: '', inline: false },
+                { name: '💜 Available Builds', value: rolesList, inline: false }
+            )
+            .setColor('#E74C3C')
+            .setFooter({ text: `Phoenix Assistance Bot • Click buttons below to sign up • Session: ${sessionId}` })
+            .setTimestamp();
+        
+        // Create buttons for each role
+        const buttons = [];
+        comp.roles.forEach((role, index) => {
+            const button = new ButtonBuilder()
+                .setCustomId(`signup_${sessionId}_${index}`)
+                .setLabel(`${index + 1}`)
+                .setStyle(ButtonStyle.Primary)
+                .setEmoji('✅');
+            buttons.push(button);
+        });
+        
+        // Split buttons into rows of 4
+        const buttonRows = [];
+        for (let i = 0; i < buttons.length; i += 4) {
+            const row = new ActionRowBuilder().addComponents(buttons.slice(i, i + 4));
+            buttonRows.push(row);
+        }
+        
+        await interaction.editReply({ 
+            embeds: [embed], 
+            components: buttonRows
+        });
+        
+    } catch (error) {
+        console.error('Error in signup command:', error);
+        if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ 
+                content: '❌ An error occurred while creating the signup session. Please try again later.'
+            });
+        } else {
+            await interaction.reply({ 
+                content: '❌ An error occurred while creating the signup session. Please try again later.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
+// Handle button interactions
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+
+    if (interaction.customId === 'enter_comp_name') {
+        // Create modal for comp name
+        const modal = new ModalBuilder()
+            .setCustomId('comp_name_modal')
+            .setTitle('Enter Comp Name');
+
+        const nameInput = new TextInputBuilder()
+            .setCustomId('comp_name')
+            .setLabel('Comp Name')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter your comp name...')
+            .setRequired(true)
+            .setMaxLength(50);
+
+        const actionRow = new ActionRowBuilder().addComponents(nameInput);
+        modal.addComponents(actionRow);
+
+        await interaction.showModal(modal);
+    } else if (interaction.customId.startsWith('add_build_')) {
+        const sessionId = interaction.customId.replace('add_build_', '');
+        
+        // Create modal for adding build
+        const modal = new ModalBuilder()
+            .setCustomId(`add_build_modal_${sessionId}`)
+            .setTitle('Add Build to Comp');
+
+        const buildInput = new TextInputBuilder()
+            .setCustomId('build_name')
+            .setLabel('Build Name')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter build name...')
+            .setRequired(true)
+            .setMaxLength(100);
+
+        const actionRow = new ActionRowBuilder().addComponents(buildInput);
+        modal.addComponents(actionRow);
+
+        await interaction.showModal(modal);
+    } else if (interaction.customId.startsWith('create_comp_')) {
+        // Proactively defer update to avoid timeout
+        await interaction.deferUpdate();
+
+        const sessionId = interaction.customId.replace('create_comp_', '');
+        const session = compSessions.get(sessionId);
+        
+        if (session) {
+            // Save to database
+            try {
+                await Composition.create({
+                    name: session.compName,
+                    roles: session.builds,
+                    createdBy: {
+                        discordId: session.userId,
+                        username: interaction.user.username
+                    }
+                });
+                
+                compSessions.delete(sessionId);
+                await interaction.editReply({ 
+                    content: '✅ Comp created and saved successfully!', 
+                    components: [],
+                    embeds: []
+                });
+            } catch (error) {
+                console.error('Error saving comp:', error);
+                await interaction.followUp({ 
+                    content: '❌ Error saving comp to database.', 
+                    ephemeral: true 
+                });
+            }
+        }
+    } else if (interaction.customId.startsWith('cancel_comp_')) {
+        // Fast enough, but let's be safe
+        await interaction.deferUpdate();
+
+        const sessionId = interaction.customId.replace('cancel_comp_', '');
+        compSessions.delete(sessionId);
+        
+        await interaction.editReply({ 
+            content: '❌ Comp creation cancelled.', 
+            components: [],
+            embeds: []
+        });
+    } else if (interaction.customId.startsWith('signup_')) {
+        // Proactively defer update to avoid timeout
+        await interaction.deferUpdate();
+
+        // Handle signup button clicks
+        const parts = interaction.customId.split('_');
+        const sessionId = parts[1];
+        const roleIndex = parseInt(parts[2]);
+        
+        try {
+            // Find the signup session
+            const session = await SignupSession.findOne({ sessionId: sessionId });
+            if (!session) {
+                await interaction.followUp({ 
+                    content: '❌ Signup session not found or expired.',
+                    ephemeral: true
+                });
+                return;
+            }
+            
+            // Check if user is registered
+            const userData = await User.findOne({ discordId: interaction.user.id });
+            if (!userData) {
+                await interaction.followUp({ 
+                    content: '❌ You need to register first with `/register` before signing up.',
+                    ephemeral: true
+                });
+                return;
+            }
+            
+            // Check if user is already signed up for this role
+            const role = session.roles[roleIndex];
+            const existingSignup = role.signups.find(signup => signup.userId === interaction.user.id);
+            
+            // If role is taken by someone else, show error
+            if (role.signups.length > 0 && !existingSignup) {
+                await interaction.followUp({ 
+                    content: `❌ This role is already taken by **${role.signups[0].ingameName}**! Only one person can sign up per role.`,
+                    ephemeral: true
+                });
+                return;
+            }
+            
+            if (existingSignup) {
+                // Remove signup
+                role.signups = role.signups.filter(signup => signup.userId !== interaction.user.id);
+                await session.save();
+            } else {
+                // Check if user is already signed up for any other role
+                const userAlreadySignedUp = session.roles.some(r => 
+                    r.signups.some(signup => signup.userId === interaction.user.id)
+                );
+                
+                if (userAlreadySignedUp) {
+                    await interaction.followUp({ 
+                        content: `❌ You're already signed up for another role! Please remove yourself from your current role first before signing up for a new one.`,
+                        ephemeral: true
+                    });
+                    return;
+                }
+                
+                // Check if this role already has someone signed up
+                if (role.signups.length > 0) {
+                    await interaction.followUp({ 
+                        content: `❌ This role is already taken by **${role.signups[0].ingameName}**! Only one person can sign up per role.`,
+                        ephemeral: true
+                    });
+                    return;
+                }
+                
+                // Add signup
+                role.signups.push({
+                    userId: interaction.user.id,
+                    username: interaction.user.username,
+                    ingameName: userData.ingameName,
+                    guild: userData.guild
+                });
+                await session.save();
+            }
+            
+            // Update the public embed without sending ephemeral message
+            await updateSignupEmbed(interaction, session);
+        } catch (error) {
+            console.error('Error in signup button:', error);
+            await interaction.followUp({ 
+                content: '❌ An error occurred while processing your signup. Please try again later.',
+                ephemeral: true
+            });
+        }
+    }
+});
+
+// Handle modal interactions
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isModalSubmit()) return;
+
+    if (interaction.customId === 'comp_name_modal') {
+        const compName = interaction.fields.getTextInputValue('comp_name');
+        
+        // Store comp session data
+        const sessionId = `${interaction.user.id}_${Date.now()}`;
+        compSessions.set(sessionId, {
+            compName: compName,
+            contentType: 'Shitters Roam', // This should come from the original command
+            builds: [],
+            userId: interaction.user.id
+        });
+        
+        // Create step 2 embed - Add builds
+        const embed = new EmbedBuilder()
+            .setTitle('💚🎭 Add Builds to Comp')
+            .addFields(
+                { name: 'Comp', value: compName, inline: false },
+                { name: 'Content Type', value: 'Shitters Roam', inline: false },
+                { name: 'Current Builds (0/20)', value: 'No builds added yet', inline: false },
+                { 
+                    name: 'Instructions', 
+                    value: '• Click "✏️ Add Build" to manually type a build name\n• You can type any build name\n• You can add the same build multiple times for variations\n• Builds will be added in the order you enter them',
+                    inline: false 
+                }
+            )
+            .setColor('#0099ff')
+            .setFooter({ text: 'Phoenix Assistance Bot • Type build names manually • Today at 1:41 PM' })
+            .setTimestamp();
+
+        // Create buttons
+        const addBuildButton = new ButtonBuilder()
+            .setCustomId(`add_build_${sessionId}`)
+            .setLabel('Add Build')
+            .setStyle(ButtonStyle.Primary)
+            .setEmoji('✏️');
+
+        const createCompButton = new ButtonBuilder()
+            .setCustomId(`create_comp_${sessionId}`)
+            .setLabel('Create Comp')
+            .setStyle(ButtonStyle.Success)
+            .setEmoji('✅');
+
+        const cancelButton = new ButtonBuilder()
+            .setCustomId(`cancel_comp_${sessionId}`)
+            .setLabel('Cancel')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('❌');
+
+        const row = new ActionRowBuilder().addComponents(addBuildButton, createCompButton, cancelButton);
+
+        await interaction.update({ 
+            embeds: [embed], 
+            components: [row]
+        });
+    } else if (interaction.customId.startsWith('add_build_modal_')) {
+        const sessionId = interaction.customId.replace('add_build_modal_', '');
+        const buildName = interaction.fields.getTextInputValue('build_name');
+        const session = compSessions.get(sessionId);
+        
+        if (session) {
+            // Add build to session
+            session.builds.push(buildName);
+            
+            // Update embed with new build count
+            const buildsList = session.builds.length > 0 ? session.builds.map((build, index) => `${index + 1}. ${build}`).join('\n') : 'No builds added yet';
+            
+            const embed = new EmbedBuilder()
+                .setTitle('💚🎭 Add Builds to Comp')
+                .addFields(
+                    { name: 'Comp', value: session.compName, inline: false },
+                    { name: 'Content Type', value: session.contentType, inline: false },
+                    { name: `Current Builds (${session.builds.length}/20)`, value: buildsList, inline: false },
+                    { 
+                        name: 'Instructions', 
+                        value: '• Click "✏️ Add Build" to manually type a build name\n• You can type any build name\n• You can add the same build multiple times for variations\n• Builds will be added in the order you enter them',
+                        inline: false 
+                    }
+                )
+                .setColor('#0099ff')
+                .setFooter({ text: 'Phoenix Assistance Bot • Type build names manually • Today at 1:41 PM' })
+                .setTimestamp();
+
+            // Create buttons with session ID
+            const addBuildButton = new ButtonBuilder()
+                .setCustomId(`add_build_${sessionId}`)
+                .setLabel('Add Build')
+                .setStyle(ButtonStyle.Primary)
+                .setEmoji('✏️');
+
+            const createCompButton = new ButtonBuilder()
+                .setCustomId(`create_comp_${sessionId}`)
+                .setLabel('Create Comp')
+                .setStyle(ButtonStyle.Success)
+                .setEmoji('✅');
+
+            const cancelButton = new ButtonBuilder()
+                .setCustomId(`cancel_comp_${sessionId}`)
+                .setLabel('Cancel')
+                .setStyle(ButtonStyle.Danger)
+                .setEmoji('❌');
+
+            const row = new ActionRowBuilder().addComponents(addBuildButton, createCompButton, cancelButton);
+
+            await interaction.update({ 
+                embeds: [embed], 
+                components: [row]
+            });
+        }
+    }
+});
+
+// Handle autocomplete interactions
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isAutocomplete()) return;
+
+    if (interaction.commandName === 'signup') {
+        await handleSignupAutocomplete(interaction);
+    } else if (interaction.commandName === 'comp') {
+        // Reuse same autocomplete for comp list subcommand
+        await handleSignupAutocomplete(interaction);
+    } else if (interaction.commandName === 'register') {
+        await handleGuildAutocomplete(interaction);
+    } else if (interaction.commandName === 'remove-guild') {
+        await handleGuildAutocomplete(interaction);
+    }
+});
+
+async function handleGuildAutocomplete(interaction) {
+    try {
+        const focusedValue = interaction.options.getFocused(true)?.value || '';
+        // Debug log
+        console.log(`[Autocomplete] Guild search for: "${focusedValue}"`);
+        
+        const allGuilds = await getAllGuildChoices();
+        console.log(`[Autocomplete] Found ${allGuilds.length} total guilds: ${allGuilds.join(', ')}`);
+        
+        const filtered = allGuilds
+            .filter(name => name.toLowerCase().includes(focusedValue.toLowerCase()))
+            .slice(0, 25);
+            
+        console.log(`[Autocomplete] Returning ${filtered.length} matches`);
+
+        if (filtered.length === 0) {
+            await interaction.respond([{
+                name: 'No guilds found. Add one with /add-guild',
+                value: focusedValue || 'no-guilds-found'
+            }]);
+            return;
+        }
+
+        await interaction.respond(filtered.map(name => ({
+            name,
+            value: name
+        })));
+    } catch (error) {
+        console.error('Error in guild autocomplete:', error);
+        // Avoid responding again if the interaction is unknown or already acknowledged
+        if (error && (error.code === 10062 || error.code === 40060)) {
+            return;
+        }
+        try {
+            await interaction.respond([{
+                name: 'Error loading guilds',
+                value: 'error-loading'
+            }]);
+        } catch (respondError) {
+            console.error('Discord Client Error in guild autocomplete:', respondError);
+        }
+    }
+}
+
+// Update signup embed function
+async function updateSignupEmbed(interaction, session) {
+    try {
+        // Calculate total signups
+        const totalSignups = session.roles.reduce((total, role) => total + role.signups.length, 0);
+        
+        // Add roles list with signups
+        const rolesList = session.roles.map((role, index) => {
+            if (role.signups.length === 0) {
+                return `${index + 1}. ${role.roleName} - No signups`;
+            } else {
+                const signupList = role.signups.map(signup => {
+                    return `<@${signup.userId}>`;
+                }).join(', ');
+                return `${index + 1}. ${role.roleName} - ${signupList}`;
+            }
+        }).join('\n');
+        
+        // Create updated embed
+        const embed = new EmbedBuilder()
+            .setTitle(`📝 Build Signup - ${totalSignups}/${session.roles.length}`)
+            .addFields(
+                { name: `${session.compName} - Available Builds`, value: '', inline: false },
+                { name: '💜 Available Builds', value: rolesList, inline: false }
+            )
+            .setColor('#E74C3C')
+            .setFooter({ text: `Assistance Bot • Click buttons below to sign up • Session: ${session.sessionId} • Today at 1:52 PM` })
+            .setTimestamp();
+        
+        // Create updated buttons
+        const buttons = [];
+        session.roles.forEach((role, index) => {
+            const isRoleTaken = role.signups.length > 0;
+            
+            let buttonStyle, emoji;
+            
+            if (isRoleTaken) {
+                // Role is taken - show lock button with muted style
+                buttonStyle = ButtonStyle.Secondary;
+                emoji = '🔒';
+            } else {
+                // Role is available - show checkmark button with muted style
+                buttonStyle = ButtonStyle.Secondary;
+                emoji = '✅';
+            }
+            
+            const button = new ButtonBuilder()
+                .setCustomId(`signup_${session.sessionId}_${index}`)
+                .setLabel(`${index + 1}`)
+                .setStyle(buttonStyle)
+                .setEmoji(emoji)
+                .setDisabled(false); // All buttons are enabled
+            buttons.push(button);
+        });
+        
+        // Split buttons into rows of 4
+        const buttonRows = [];
+        for (let i = 0; i < buttons.length; i += 4) {
+            const row = new ActionRowBuilder().addComponents(buttons.slice(i, i + 4));
+            buttonRows.push(row);
+        }
+        
+        if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ 
+                embeds: [embed], 
+                components: buttonRows
+            });
+        } else {
+            await interaction.update({ 
+                embeds: [embed], 
+                components: buttonRows
+            });
+        }
+        
+    } catch (error) {
+        console.error('Error updating signup embed:', error);
+    }
+}
+
+
+
+
+
+// Enhanced error handling and memory management
+client.on('error', (error) => {
+    console.error('❌ Discord Client Error:', error);
+    // Don't exit the process, let Discord.js handle reconnection
+});
+
+client.on('warn', (warning) => {
+    console.warn('⚠️ Discord Client Warning:', warning);
+});
+
+// Handle rate limits
+client.on('rateLimit', (rateLimitData) => {
+    console.warn('⏱️ Rate limited:', rateLimitData);
+});
+
+// Handle invalid session
+client.on('invalidSession', () => {
+    console.log('🔄 Invalid session, reconnecting...');
+});
+
+// Connection monitoring and auto-reconnect
+let reconnectAttempts = 0;
+const maxReconnectAttempts = 15;
+let reconnectTimeout;
+
+const attemptReconnect = () => {
+    if (reconnectAttempts >= maxReconnectAttempts) {
+        console.error('❌ Max reconnection attempts reached. Exiting to allow auto-restart...');
+        process.exit(1);
+    }
+    
+    reconnectAttempts++;
+    console.log(`🔄 Attempting to reconnect... (${reconnectAttempts}/${maxReconnectAttempts})`);
+    
+    // Clear any existing timeout
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+    }
+    
+    // Attempt to reconnect after a delay
+    reconnectTimeout = setTimeout(() => {
+        if (!client.isReady()) {
+            console.log('🔄 Forcing reconnection...');
+            client.destroy().then(() => {
+                client.login(config.botToken).catch(error => {
+                    console.error('❌ Reconnection failed:', error);
+                    attemptReconnect(); // Try again
+                });
+            });
+        }
+    }, 5000 * reconnectAttempts); // Exponential backoff
+};
+
+// Monitor connection status
+setInterval(() => {
+    if (!client.isReady()) {
+        console.log('⚠️ Bot is not ready, attempting reconnection...');
+        attemptReconnect();
+    } else {
+        // Reset reconnect attempts on successful connection
+        reconnectAttempts = 0;
+    }
+}, 30000); // Check every 30 seconds
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('❌ Uncaught Exception:', error);
+    // Don't exit the process, just log the error
+});
+
+// Memory usage monitoring and connection health checks
+setInterval(() => {
+    const memUsage = process.memoryUsage();
+    const memUsageMB = {
+        rss: Math.round(memUsage.rss / 1024 / 1024 * 100) / 100,
+        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024 * 100) / 100,
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024 * 100) / 100,
+        external: Math.round(memUsage.external / 1024 / 1024 * 100) / 100
+    };
+    
+    // Log memory usage and connection status every 10 minutes
+    console.log('📊 Memory Usage (MB):', memUsageMB);
+    console.log('🔗 Discord Status:', client.isReady() ? 'Connected' : 'Disconnected');
+    console.log('⏱️ Uptime:', Math.round(process.uptime() / 60), 'minutes');
+    
+    // Force garbage collection if memory usage is high
+    if (memUsageMB.heapUsed > 150) { // More than 150MB
+        if (global.gc) {
+            global.gc();
+            console.log('🗑️ Garbage collection triggered');
+        }
+    }
+    
+    // Check if bot is still connected to Discord
+    if (!client.isReady()) {
+        console.log('⚠️ Bot appears disconnected, attempting reconnection...');
+        attemptReconnect();
+    }
+}, 10 * 60 * 1000); // Every 10 minutes
+
+// Additional health check for Discord connection
+setInterval(() => {
+    if (client.isReady()) {
+        // Update presence to show bot is active
+        client.user.setPresence({
+            activities: [{
+                name: `Albion Online Alliance | ${client.guilds.cache.size} servers`,
+                type: 0 // Playing
+            }],
+            status: 'online'
+        });
+    }
+}, 5 * 60 * 1000); // Every 5 minutes
+
+// Create a robust HTTP server for Render with health checks
+const http = require('http');
+const url = require('url');
+
+const server = http.createServer((req, res) => {
+    const parsedUrl = url.parse(req.url, true);
+    const path = parsedUrl.pathname;
+    
+    // Set CORS headers for monitoring services
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+    
+    if (path === '/health' || path === '/ping' || path === '/') {
+        // Health check endpoint for monitoring services
+        const memUsage = process.memoryUsage();
+        const healthData = {
+            status: client.isReady() ? 'online' : 'offline',
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            memory: {
+                rss: Math.round(memUsage.rss / 1024 / 1024 * 100) / 100,
+                heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024 * 100) / 100,
+                heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024 * 100) / 100,
+                external: Math.round(memUsage.external / 1024 / 1024 * 100) / 100
+            },
+            discord: {
+                status: client.isReady() ? 'connected' : 'disconnected',
+                guilds: client.guilds?.cache?.size || 0,
+                ping: client.ws?.ping || 'N/A',
+                gateway: client.ws?.gateway || 'N/A'
+            },
+            reconnectAttempts: reconnectAttempts,
+            version: process.version,
+            platform: process.platform
+        };
+        
+        const statusCode = client.isReady() ? 200 : 503;
+        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(healthData, null, 2));
+    } else if (path === '/status') {
+        // Simple status endpoint
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Discord Bot is running!');
+    } else {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`🌐 HTTP server running on port ${PORT}`);
+    console.log(`🏥 Health check available at: http://localhost:${PORT}/health`);
+    console.log(`📊 Status endpoint: http://localhost:${PORT}/status`);
+});
+
+// Self-pinging mechanism to keep bot alive on Render
+let selfPingInterval;
+const startSelfPing = () => {
+    const pingUrl = `http://localhost:${PORT}/health`;
+    
+    selfPingInterval = setInterval(async () => {
+        try {
+            const response = await fetch(pingUrl);
+            if (response.ok) {
+                console.log('🔄 Self-ping successful - Bot is alive');
+            } else {
+                console.log('⚠️ Self-ping failed - Response not OK');
+            }
+        } catch (error) {
+            console.error('❌ Self-ping error:', error.message);
+        }
+    }, 5 * 60 * 1000); // Ping every 5 minutes
+    
+    console.log('🔄 Self-ping mechanism started (every 5 minutes)');
+};
+
+// Start self-ping after server is ready
+server.on('listening', () => {
+    startSelfPing();
+});
+
+// Graceful shutdown
+const gracefulShutdown = (signal) => {
+    console.log(`🛑 Received ${signal}, shutting down gracefully...`);
+    
+    // Clear all intervals
+    if (selfPingInterval) {
+        clearInterval(selfPingInterval);
+    }
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+    }
+    
+    // Destroy Discord client
+    if (client.isReady()) {
+        client.destroy();
+        console.log('✅ Discord client destroyed');
+    }
+    
+    // Close HTTP server
+    server.close(() => {
+        console.log('✅ HTTP server closed');
+        process.exit(0);
+    });
+    
+    // Force exit after 10 seconds
+    setTimeout(() => {
+        console.log('⚠️ Forced shutdown after timeout');
+        process.exit(1);
+    }, 10000);
+};
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// Login to Discord with retry logic
+const loginWithRetry = async (retries = 3) => {
+    // Validate token before attempting login
+    if (!config.botToken || config.botToken.trim().length === 0) {
+        console.error('❌ BOT_TOKEN is missing or empty!');
+        console.error('Please set BOT_TOKEN in your Render environment variables.');
+        console.error('Go to your Render dashboard > Environment > Add BOT_TOKEN');
+        process.exit(1);
+    }
+
+    // Basic token format validation (Discord bot tokens typically start with specific patterns)
+    if (config.botToken.length < 50) {
+        console.error('❌ BOT_TOKEN appears to be invalid (too short).');
+        console.error('Discord bot tokens are typically 59+ characters long.');
+        console.error('Please verify your BOT_TOKEN in Render environment variables.');
+        process.exit(1);
+    }
+
+    try {
+        console.log('🔑 Attempting to login with token:', config.botToken ? config.botToken.substring(0, 10) + '...' : 'undefined');
+        console.log('📏 Token length:', config.botToken.length);
+        await client.login(config.botToken);
+        console.log('✅ Successfully logged in to Discord');
+    } catch (error) {
+        console.error('❌ Login failed:', error.message);
+        
+        // Provide helpful error messages
+        if (error.message.includes('invalid token') || error.message.includes('401')) {
+            console.error('💡 Troubleshooting tips:');
+            console.error('   1. Verify your BOT_TOKEN in Render dashboard > Environment');
+            console.error('   2. Make sure there are no extra spaces or quotes around the token');
+            console.error('   3. Check if the token was regenerated - you may need a new one');
+            console.error('   4. Go to https://discord.com/developers/applications to get a fresh token');
+        }
+        
+        if (retries > 0) {
+            console.log(`🔄 Retrying login in 5 seconds... (${retries} attempts left)`);
+            setTimeout(() => {
+                loginWithRetry(retries - 1);
+            }, 5000);
+        } else {
+            console.error('❌ Max login attempts reached. Exiting...');
+            process.exit(1);
+        }
+    }
+};
+
+// Start the bot
+loginWithRetry();
+
