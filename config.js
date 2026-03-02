@@ -35,7 +35,6 @@ module.exports = {
     // Content Types
     contentTypes: {
         'Royals': {
-            color: '#0099ff'
         },
         'HO': {
             color: '#FF6B35'
