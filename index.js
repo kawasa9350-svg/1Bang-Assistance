@@ -1,3 +1,4 @@
+require('./logger')('1Bang Bot');
 const { Client, GatewayIntentBits, Collection, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, PermissionFlagsBits, ComponentType } = require('discord.js');
 const mongoose = require('mongoose');
 const fetch = require('node-fetch');
@@ -204,6 +205,83 @@ async function handleRegisterCommand(interaction) {
     try {
         const selectedGuild = interaction.options.getString('guild');
         const ingameName = interaction.options.getString('ingame_name').trim();
+
+        const existingUser = await User.findOne({ discordId: interaction.user.id });
+
+        if (existingUser && existingUser.ingameName.toLowerCase() === ingameName.toLowerCase()) {
+            // User is already registered with this name, treat it as a re-registration
+            const member = await interaction.guild.members.fetch(interaction.user.id);
+            const matches = await searchAlbionPlayers(ingameName);
+
+            if (matches.length === 0) {
+                await interaction.editReply({ content: `❌ Could not find your character **${ingameName}** in the Albion API.` });
+                return;
+            }
+
+            const playerDetails = await getPlayerDetails(matches[0].Id);
+            const currentApiGuildName = playerDetails.guildName;
+
+            if (existingUser.guild === currentApiGuildName) {
+                await interaction.editReply({ content: `✅ You are already registered with the correct guild (**${currentApiGuildName}**). No changes needed.` });
+                return;
+            }
+
+            const oldGuildConfig = await getGuildConfigByName(existingUser.guild);
+            if (oldGuildConfig && oldGuildConfig.roleId) {
+                try {
+                    const role = interaction.guild.roles.cache.get(oldGuildConfig.roleId);
+                    if (role && member.roles.cache.has(oldGuildConfig.roleId)) {
+                        await member.roles.remove(role);
+                    }
+                } catch (error) {
+                    console.error(`Error removing old role for ${existingUser.username}:`, error);
+                }
+            }
+
+            const newGuildConfig = await getGuildConfigByName(currentApiGuildName);
+            let newNickname;
+            if (newGuildConfig) {
+                existingUser.guild = newGuildConfig.name;
+                if (newGuildConfig.roleId) {
+                    try {
+                        const role = interaction.guild.roles.cache.get(newGuildConfig.roleId);
+                        if (role) {
+                            await member.roles.add(role);
+                        }
+                    } catch (error) {
+                        console.error(`Error adding new role for ${existingUser.username}:`, error);
+                    }
+                }
+                newNickname = newGuildConfig.tag ? `${newGuildConfig.tag} ${ingameName}` : ingameName;
+            } else {
+                existingUser.guild = currentApiGuildName; // Update to the new guild name even if not configured
+                newNickname = ingameName; // No tag if guild is not configured
+            }
+
+            try {
+                await member.setNickname(newNickname);
+            } catch (error) {
+                console.error(`Error updating nickname for ${existingUser.username}:`, error);
+                await interaction.followUp({ content: `⚠️ Could not update your nickname due to permissions. Please set it to **${newNickname}** manually.`, ephemeral: true });
+            }
+
+            await existingUser.save();
+
+            const embed = new EmbedBuilder()
+                .setTitle('✅ Re-registration Successful!')
+                .setDescription(`Your registration has been updated.`)
+                .setColor(newGuildConfig ? newGuildConfig.color : config.embedColor)
+                .addFields(
+                    { name: 'In-Game Name', value: ingameName, inline: true },
+                    { name: 'New Guild', value: currentApiGuildName || 'None', inline: true },
+                    { name: 'Old Guild', value: existingUser.guild, inline: true }
+                )
+                .setTimestamp();
+
+            await interaction.editReply({ embeds: [embed] });
+            return; // End execution for re-registration
+        }
+
         const guildConfig = await getGuildConfigByName(selectedGuild);
         
         if (!guildConfig) {
@@ -852,7 +930,7 @@ async function handleLootsplitCommand(interaction) {
                         console.log(`[Lootsplit] Sending to Phoenix: Total=${phoenixTaxableLoot}, SilverBags=${phoenixSilverBags}, Participants=${phoenixRebelsUserIds.length}`);
 
                         // Send actual callerId - Phoenix will only credit caller fee if caller is Phoenix Rebels
-                        const res = await fetch(config.phoenixWebhookUrl, {
+                        const res = await fetch(`${(config.phoenixWebhookUrl || '').replace(/\/$/, '')}/ingest-lootsplit`, {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json',
@@ -1712,124 +1790,17 @@ setInterval(() => {
     }
 }, 5 * 60 * 1000); // Every 5 minutes
 
-// Create a robust HTTP server for Render with health checks
-const http = require('http');
-const url = require('url');
+// Uptime monitoring disabled by user request
+// process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+// process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-const server = http.createServer((req, res) => {
-    const parsedUrl = url.parse(req.url, true);
-    const path = parsedUrl.pathname;
-    
-    // Set CORS headers for monitoring services
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
-    if (req.method === 'OPTIONS') {
-        res.writeHead(200);
-        res.end();
-        return;
-    }
-    
-    if (path === '/health' || path === '/ping' || path === '/') {
-        // Health check endpoint for monitoring services
-        const memUsage = process.memoryUsage();
-        const healthData = {
-            status: client.isReady() ? 'online' : 'offline',
-            timestamp: new Date().toISOString(),
-            uptime: process.uptime(),
-            memory: {
-                rss: Math.round(memUsage.rss / 1024 / 1024 * 100) / 100,
-                heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024 * 100) / 100,
-                heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024 * 100) / 100,
-                external: Math.round(memUsage.external / 1024 / 1024 * 100) / 100
-            },
-            discord: {
-                status: client.isReady() ? 'connected' : 'disconnected',
-                guilds: client.guilds?.cache?.size || 0,
-                ping: client.ws?.ping || 'N/A',
-                gateway: client.ws?.gateway || 'N/A'
-            },
-            reconnectAttempts: reconnectAttempts,
-            version: process.version,
-            platform: process.platform
-        };
-        
-        const statusCode = client.isReady() ? 200 : 503;
-        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(healthData, null, 2));
-    } else if (path === '/status') {
-        // Simple status endpoint
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Discord Bot is running!');
-    } else {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('Not Found');
-    }
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🌐 HTTP server running on port ${PORT}`);
-    console.log(`🏥 Health check available at: http://localhost:${PORT}/health`);
-    console.log(`📊 Status endpoint: http://localhost:${PORT}/status`);
-});
-
-// Self-pinging mechanism to keep bot alive on Render
-let selfPingInterval;
-const startSelfPing = () => {
-    const pingUrl = `http://localhost:${PORT}/health`;
-    
-    selfPingInterval = setInterval(async () => {
-        try {
-            const response = await fetch(pingUrl);
-            if (response.ok) {
-                console.log('🔄 Self-ping successful - Bot is alive');
-            } else {
-                console.log('⚠️ Self-ping failed - Response not OK');
-            }
-        } catch (error) {
-            console.error('❌ Self-ping error:', error.message);
-        }
-    }, 5 * 60 * 1000); // Ping every 5 minutes
-    
-    console.log('🔄 Self-ping mechanism started (every 5 minutes)');
-};
-
-// Start self-ping after server is ready
-server.on('listening', () => {
-    startSelfPing();
-});
-
-// Graceful shutdown
 const gracefulShutdown = (signal) => {
     console.log(`🛑 Received ${signal}, shutting down gracefully...`);
-    
-    // Clear all intervals
-    if (selfPingInterval) {
-        clearInterval(selfPingInterval);
-    }
-    if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-    }
-    
-    // Destroy Discord client
     if (client.isReady()) {
         client.destroy();
         console.log('✅ Discord client destroyed');
     }
-    
-    // Close HTTP server
-    server.close(() => {
-        console.log('✅ HTTP server closed');
-        process.exit(0);
-    });
-    
-    // Force exit after 10 seconds
-    setTimeout(() => {
-        console.log('⚠️ Forced shutdown after timeout');
-        process.exit(1);
-    }, 10000);
+    process.exit(0);
 };
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
