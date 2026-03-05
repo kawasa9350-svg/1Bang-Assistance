@@ -1,1 +1,1 @@
-npx nodemon index.js
+npx nodemon --node-args="--openssl-legacy-provider" index.js
