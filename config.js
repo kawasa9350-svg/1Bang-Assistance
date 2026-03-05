@@ -28,7 +28,7 @@ module.exports = {
         'Phoenix Rebels': {
             roleId: process.env.PHOENIX_REBELS_ROLE_ID,
             tag: '[PHNX]',
-            color: '#FF6B35'
+            color: '#FF6B3'
         }
     },
 
@@ -62,3 +62,4 @@ module.exports = {
     prefix: process.env.PREFIX || '!',
     embedColor: process.env.EMBED_COLOR || '#0099ff'
 };
+
