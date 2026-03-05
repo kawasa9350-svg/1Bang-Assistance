@@ -51,7 +51,7 @@ module.exports = {
         : 0,
     
     // Phoenix webhook (for pushing splits to Phoenix Assistance)
-    phoenixWebhookUrl: process.env.PHOENIX_WEBHOOK_URL || '',
+    phoenixWebhookUrl: 'http://localhost:25597',
     phoenixWebhookSecret: process.env.PHOENIX_WEBHOOK_SECRET || '',
     phoenixTargetGuildId: process.env.PHOENIX_TARGET_GUILD_ID || '',
     

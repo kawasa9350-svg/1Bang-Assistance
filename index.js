@@ -126,7 +126,7 @@ mongoose.connect(config.mongoUri)
     .catch(err => console.error('❌ MongoDB connection error:', err));
 
 // Bot ready event
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`✅ Bot is online as ${client.user.tag}`);
     console.log(`📊 Serving ${client.guilds.cache.size} servers`);
     console.log(`🔗 Bot ID: ${client.user.id}`);
